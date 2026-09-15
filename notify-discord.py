@@ -1,196 +1,379 @@
-# Inital version created by https://github.com/Bluscream and https://github.com/IAmOrion
-# Originally copied from here: https://github.com/ccrisan/motioneyeos/issues/1557#issuecomment-399692426 and then modified slightly
+"""Send motionEye notifications with recording links and inline video."""  # pylint: disable=invalid-name
 
-# Installation:
-# Save this file as /data/etc/notify-discord.py on your MotionEyeOS device
-# Add the example command below in the MotionEyeOS UI under: Settings > File Storage > Run A Command
+# Python 2.7 does not support the "raise ... from ..." syntax.
+# pylint: disable=raise-missing-from
 
-# Example Command:
-# python /data/etc/notify-discord.py -n "Kitchen Camera" -p %f --usetitle -q %q -t "%d/%m/%Y - %H:%M:%S" -v %v --hookid "someid" --hooktoken "sometoken"
+# Initial version created by https://github.com/Bluscream and https://github.com/IAmOrion
+# Originally copied from:
+# https://github.com/ccrisan/motioneyeos/issues/1557#issuecomment-399692426
+# and then modified slightly.
 
 import argparse
-import datetime
-import glob
+import errno
+import hashlib
 import json
-import os
+import math
+import re
+import socket
+import ssl
+import sys
 import time
-from argparse import RawDescriptionHelpFormatter
 
-import cStringIO
-import pycurl
-import pytz
+try:
+    from http.cookiejar import CookieJar
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+    from urllib.request import HTTPCookieProcessor, Request, build_opener
+except ImportError:  # Python 2.7 on older motionEyeOS installations.
+    from cookielib import CookieJar  # pylint: disable=import-error
+    from urllib import quote, urlencode  # pylint: disable=no-name-in-module
+    from urllib2 import (  # pylint: disable=import-error
+        HTTPError,
+        HTTPCookieProcessor,
+        Request,
+        URLError,
+        build_opener,
+    )
+    from urlparse import parse_qsl, urlsplit, urlunsplit  # pylint: disable=import-error
+
+HTTP_TIMEOUT = 30
+DISCORD_USER_AGENT = (
+    "DiscordBot (https://github.com/RampantDespair/motioneyeos-discord-notifier, 1.0)"
+)
+COMPONENTS_V2 = 1 << 15
+TEXT_DISPLAY = 10
+MEDIA_GALLERY = 12
+STRING_TYPES = (str, type(""))  # pylint: disable=redundant-u-string-prefix
+SIGNATURE_FILTER = re.compile(r'[^a-zA-Z0-9/?_.=&{}\[\]":, -]')
 
 
-class motionEyeDiscordWebHook(object):
+class NotificationError(Exception):
+    """A notification could not be built or delivered."""
+
+
+def http_url(value):
+    """Validate an HTTP URL without embedding login credentials in it."""
+    try:
+        parts = urlsplit(value)
+        valid = (
+            parts.scheme in ("http", "https")
+            and parts.hostname
+            and parts.username is None
+            and not parts.fragment
+        )
+        # Accessing port also validates malformed port numbers.
+        if parts.port is not None and not 0 < parts.port < 65536:
+            valid = False
+    except ValueError:
+        valid = False
+    if not valid:
+        raise argparse.ArgumentTypeError(
+            "Expected an HTTP(S) URL without credentials or a fragment"
+        )
+    return value
+
+
+def parse_args(argv=None):
+    """Parse notification settings and validate the arguments needed for each event."""
     parser = argparse.ArgumentParser(
-        description="Discord Webhook Script for MotionEye.\nYou can use this script as a Motion Event Notification",
-        epilog="Written by James Tanner aka IAmOrion.\nhttps://github.com/IAmOrion\n ",
-        formatter_class=RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--hookid", help="Discord webhook id", type=str)
-    parser.add_argument("--hooktoken", help="Discord webhook token", type=str)
-    parser.add_argument("-n", "--name", help="Camera name", type=str, default="Camera")
-    parser.add_argument(
-        "-p",
-        "--path",
-        help="Camera folder path",
-        type=str,
-        default="/data/output/Camera1/",
+        description="Configure motion notifications with a recording link and inline video."
     )
     parser.add_argument(
-        "--usetitle",
-        help="Adds a message title.  Customise with --title 'Your Title' ",
-        action="store_true",
+        "--webhook-url",
+        help="Full Discord webhook URL",
+        type=http_url,
+        required=True,
     )
     parser.add_argument(
-        "--title",
-        help="Message Title",
-        type=str,
-        default="__**Motion Detected!**__\n\n",
-    )
-    parser.add_argument("-m", "--mention", help="Mention User(s)", type=str)
-    parser.add_argument(
-        "-f",
-        "--folder",
-        help="Still Image -> Image File Name - eg if Image File Name is set to %%d-%%m-%%Y/%%H-%%M-%%S we want the folder, in this case it would be %%d-%%m-%%Y",
-        type=str,
-        default="%d-%m-%Y",
+        "--event",
+        help="Motion event being reported",
+        choices=("start", "end"),
+        required=True,
     )
     parser.add_argument(
-        "-l",
-        "--lastsnap",
-        help="Uses MotionEye's lastsnap.jpg alias - only valid when using LOCAL Storage.  Won't work with Network Shared Storage",
-        action="store_true",
+        "-n", "--name", help="Camera name shown in the notification", required=True
     )
     parser.add_argument(
-        "-t", "--time", help="%%d/%%m/%%Y - %%H:%%M:%%S from motionEyeOS", type=str
+        "-t",
+        "--time",
+        help="Event timestamp or strftime format expanded using local system time",
+        required=True,
     )
     parser.add_argument(
-        "--datetimeformat",
-        help="For example: %%d/%%m/%%Y - %%H:%%M:%%S",
-        type=str,
-        default="%d/%m/%Y - %H:%M:%S",
+        "--motioneye-url",
+        help="motionEye base URL for playback links and, by default, API requests",
+        type=http_url,
     )
     parser.add_argument(
-        "-q", "--frame", help="%%q option from motionEyeOS (Frame number)", type=int
-    )
-    parser.add_argument("-v", "--eventnumber", help="%%v from motionEyeOS", type=int)
-    parser.add_argument(
-        "--noimage",
-        help="If no picture found, sends a 'noimage' placeholder instead of sending no image at all. Image used must exist at: /data/output/noimage.jpg",
-        action="store_true",
+        "--motioneye-api-url",
+        help="Optional separate base URL for API requests from this machine",
+        type=http_url,
     )
     parser.add_argument(
-        "--delete", help="Will delete file(s) after sending", action="store_true"
+        "--camera-id", help="Camera ID used in motionEye playback URLs", type=int
     )
     parser.add_argument(
-        "--debug", help="Prints debug information to console", action="store_true"
+        "--motioneye-username",
+        help="Username for querying motionEye when authentication is required",
     )
-    args = parser.parse_args()
-    MESSAGE = ""
+    parser.add_argument(
+        "--motioneye-password",
+        help="Password for querying motionEye when authentication is required",
+    )
 
-    if args.debug:
-        print("Notifying Discord")
+    args = parser.parse_args(argv)
+    if args.camera_id is not None and args.camera_id <= 0:
+        parser.error("--camera-id must be a positive integer")
+    for name in ("motioneye_url", "motioneye_api_url"):
+        value = getattr(args, name)
+        if value and urlsplit(value).query:
+            parser.error(
+                "--" + name.replace("_", "-") + " must be a base URL without a query string"
+            )
+    if args.motioneye_password is not None and not args.motioneye_username:
+        parser.error("--motioneye-password requires --motioneye-username")
 
-    if args.usetitle:
-        MESSAGE += "%s" % args.title
+    if args.event == "end":
+        required = ("motioneye_url", "camera_id")
+        missing = [
+            "--" + name.replace("_", "-")
+            for name in required
+            if not getattr(args, name)
+        ]
+        if missing:
+            parser.error("--event end requires " + ", ".join(missing))
 
-    if args.mention:
-        MESSAGE += "%s " % args.mention
+    return args
 
-    def get_latest_file(self):
-        if os.path.isfile(self.args.path) and not os.path.isdir(self.args.path):
-            return self.args.path
 
-        TODAYS_DATE = datetime.datetime.today().strftime(self.args.folder)
-        TODAYS_DATE_FOLDER = self.args.path + TODAYS_DATE + "/*.jpg"
-        LIST_OF_FILES = glob.glob(TODAYS_DATE_FOLDER)
+def connection_error_detail(error):
+    """Describe transport failures without exposing URLs or arbitrary exception text."""
+    reason = getattr(error, "reason", error)
+    if isinstance(reason, socket.gaierror):
+        return "DNS lookup failed"
+    if isinstance(reason, socket.timeout):
+        return "connection timed out"
+    if isinstance(reason, ssl.SSLError):
+        return "TLS/SSL handshake or certificate error"
+    error_number = getattr(reason, "errno", None)
+    if isinstance(error_number, int):
+        return errno.errorcode.get(error_number, "socket error " + str(error_number))
+    return type(error).__name__
+
+
+def request(opener, url, data=None, headers=None, service="HTTP"):
+    """Return an HTTP status and body, keeping cookies in memory and bounding network waits."""
+    http_request = Request(url, data=data, headers=headers or {})
+    try:
         try:
-            return max(LIST_OF_FILES, key=os.path.getctime)
-        except ValueError:
-            if (
-                self.args.lastsnap
-                and os.path.isfile(self.args.path + "lastsnap.jpg")
-                and not os.path.isdir(self.args.path + "lastsnap.jpg")
-            ):
-                return self.args.path + "lastsnap.jpg"
-            else:
-                if self.args.noimage:
-                    return "/data/output/noimage.jpg"
-                else:
-                    return ""
+            response = opener.open(http_request, timeout=HTTP_TIMEOUT)
+        except HTTPError as error:
+            response = error
+        try:
+            return response.getcode(), response.read()
+        finally:
+            response.close()
+    except (URLError, socket.error) as error:
+        # Do not include request URLs, webhook tokens, or login data in errors.
+        raise NotificationError(service + " connection failed: " + connection_error_detail(error))
 
-    def send_to_discord(self, FILENAME=""):
-        buf = cStringIO.StringIO()
-        c = pycurl.Curl()
-        c.setopt(
-            c.URL,
-            "https://discordapp.com/api/webhooks/"
-            + self.args.hookid
-            + "/"
-            + self.args.hooktoken,
+
+def response_error_detail(body):
+    """Extract numeric error codes without printing response text that may contain secrets."""
+    text = body.decode("utf-8", errors="replace")
+    try:
+        result = json.loads(text)
+    except ValueError:
+        match = re.search(r"\berror code:\s*(\d{3,6})\b", text, re.IGNORECASE)
+        if match:
+            return " (upstream error code " + match.group(1) + ")"
+        return " (non-JSON response)"
+    if isinstance(result, dict) and isinstance(result.get("code"), int):
+        return " (API error code " + str(result["code"]) + ")"
+    return ""
+
+
+def read_json(status, body, service):
+    """Decode an API response and report failures without exposing response secrets."""
+    if not 200 <= status < 300:
+        raise NotificationError(
+            service + " returned HTTP " + str(status) + response_error_detail(body)
         )
-        c.setopt(c.WRITEFUNCTION, buf.write)
-        c.setopt(c.HTTPHEADER, ["Content-Type: multipart/form-data"])
-        c.setopt(c.USERAGENT, "MotionEyeOS")
-        utc = pytz.timezone("UTC")
-        now = utc.localize(datetime.datetime.utcnow())
-        la = pytz.timezone(
-            os.path.realpath("/data/etc/localtime").replace(
-                "/usr/share/zoneinfo/posix/", ""
-            )
+    try:
+        result = json.loads(body.decode("utf-8"))
+    except ValueError:
+        raise NotificationError(service + " returned invalid JSON")
+    if not isinstance(result, dict) or result.get("error"):
+        raise NotificationError(service + " returned an API error")
+    return result
+
+
+def signed_motioneye_url(url, username, password):
+    """Sign a GET URL using the legacy motionEye request-signature protocol."""
+    # Protocol reference: motioneye-project/motioneye-client, utils.compute_signature.
+    parts = list(urlsplit(url))
+    query = parse_qsl(parts[3], keep_blank_values=True)
+    query = [
+        (key, value) for key, value in query if key not in ("_username", "_signature")
+    ]
+    query.append(("_username", username))
+    query.sort(key=lambda pair: pair[0])
+    parts[3] = "&".join(
+        key + "=" + quote(value.encode("utf-8"), safe="!'()*~") for key, value in query
+    )
+    canonical = urlunsplit(("", "", parts[2], parts[3], ""))
+    canonical = SIGNATURE_FILTER.sub("-", canonical)
+    password_hash = hashlib.sha1(password.encode("utf-8")).hexdigest()
+    signature = hashlib.sha1(
+        ("GET:" + canonical + "::" + password_hash).encode("utf-8")
+    ).hexdigest()
+    parts[3] += "&_signature=" + signature
+    return urlunsplit(parts)
+
+
+class MotionEyeClient:
+    """Read recording metadata using anonymous, session, or legacy authentication."""
+
+    def __init__(self, base_url, username=None, password=None):
+        self.base_url = base_url.rstrip("/")
+        self.username = username
+        self.password = password or ""
+        self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        self.legacy_auth = False
+
+    def login(self):
+        """Log in if credentials were supplied; older servers use signed GET requests."""
+        if not self.username:
+            return
+        form = urlencode({"username": self.username, "password": self.password}).encode(
+            "utf-8"
         )
-        local_time = now.astimezone(la)
+        status, body = request(
+            self.opener,
+            self.base_url + "/login",
+            form,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+            service="motionEye login",
+        )
+        if status in (400, 404, 405):
+            self.legacy_auth = True
+            return
+        read_json(status, body, "motionEye login")
 
-        UTC_TIMESTAMP = local_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        MESSAGE_TIME = local_time.strftime(self.args.datetimeformat)
+    def latest_recording(self, camera_id):
+        """Fetch the camera's full movie list and return its newest recording metadata."""
+        url = self.base_url + "/movie/" + str(camera_id) + "/list"
+        if self.legacy_auth:
+            url = signed_motioneye_url(url, self.username, self.password)
+        status, body = request(self.opener, url, service="motionEye movie list")
+        result = read_json(status, body, "motionEye movie list")
+        return newest_recording(result.get("mediaList"))
 
-        if self.args.time:
-            MESSAGE_TIME += " (MEOS Time: %s)" % self.args.time
-        if self.args.frame:
-            MESSAGE_TIME += " [Frame: %s]" % self.args.frame
 
-        self.MESSAGE += MESSAGE_TIME + " | Motion was detected on %s" % self.args.name
-
-        if os.path.isfile(FILENAME):
-            c.setopt(
-                c.HTTPPOST,
-                [
-                    ("payload_json", json.dumps({"content": self.MESSAGE})),
-                    (
-                        "file",
-                        (
-                            c.FORM_FILE,
-                            FILENAME,
-                        ),
-                    ),
-                ],
+def newest_recording(recordings):
+    """Select by numeric timestamp, rather than API order or a guessed filename."""
+    if not isinstance(recordings, list):
+        raise NotificationError("motionEye returned an invalid movie list")
+    if not recordings:
+        raise NotificationError("No recordings are available for this camera")
+    candidates = []
+    for recording in recordings:
+        if not isinstance(recording, dict):
+            raise NotificationError("motionEye returned invalid recording metadata")
+        path = recording.get("path")
+        if not isinstance(path, STRING_TYPES) or not path.strip("/"):
+            raise NotificationError("motionEye returned a recording without a name")
+        try:
+            timestamp = float(recording["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            raise NotificationError(
+                "motionEye returned a recording without a valid timestamp"
             )
-        else:
-            c.setopt(
-                c.HTTPPOST, [("payload_json", json.dumps({"content": self.MESSAGE}))]
+        if math.isnan(timestamp) or math.isinf(timestamp):
+            raise NotificationError(
+                "motionEye returned a non-finite recording timestamp"
             )
+        candidates.append((timestamp, path, recording))
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
 
-        c.setopt(c.VERBOSE, self.args.debug)
-        c.perform()
-        c.close()
-        f = buf.getvalue()
-        buf.close()
 
-        if self.args.delete:
-            _path = self.args.path
+def playback_url(base_url, camera_id, recording):
+    """Build a playback URL from the relative recording name returned by motionEye."""
+    name = recording["path"].lstrip("/")
+    if any(part in (".", "..") for part in name.split("/")) or "\\" in name:
+        raise NotificationError("motionEye returned an invalid recording name")
+    return (
+        base_url.rstrip("/")
+        + "/movie/"
+        + str(camera_id)
+        + "/playback/"
+        + quote(name.encode("utf-8"), safe="/")
+    )
 
-            if os.path.isfile(_path) and not os.path.isdir(_path):
-                os.remove(_path)
-                thumbnail = "%s.thumb" % _path
 
-                if os.path.isfile(thumbnail):
-                    os.remove(thumbnail)
+def build_payload(args, video_url=None):
+    """Build a start message or an end message containing the same link and inline video."""
+    action = "started" if args.event == "start" else "ended"
+    event_time = time.strftime(args.time)
+    text = "Motion " + action + " on " + args.name + " at `" + event_time + "`"
+    mentions = {"parse": []}
+    if args.event == "start":
+        return {"content": text, "allowed_mentions": mentions}
+    if not video_url:
+        raise NotificationError("An end notification requires a recording URL")
+    return {
+        "flags": COMPONENTS_V2,
+        "allowed_mentions": mentions,
+        "components": [
+            {"type": TEXT_DISPLAY, "content": text + "\n" + video_url},
+            {"type": MEDIA_GALLERY, "items": [{"media": {"url": video_url}}]},
+        ],
+    }
 
-        if self.args.debug:
-            print(f)
+
+def send_notification(webhook_url, payload):
+    """Send JSON to Discord and require server confirmation of message creation."""
+    parts = list(urlsplit(webhook_url))
+    query = dict(parse_qsl(parts[3], keep_blank_values=True))
+    query.update({"wait": "true", "with_components": "true"})
+    parts[3] = urlencode(query)
+    # A separate opener keeps motionEye session cookies away from the webhook request.
+    status, body = request(
+        build_opener(),
+        urlunsplit(parts),
+        json.dumps(payload).encode("utf-8"),
+        {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": DISCORD_USER_AGENT,
+        },
+        service="Discord webhook",
+    )
+    result = read_json(status, body, "Discord webhook")
+    if not result.get("id"):
+        raise NotificationError("Discord did not confirm message creation")
+
+
+def main(argv=None):
+    """Resolve the recording for end events, deliver the notification, and report failures."""
+    args = parse_args(argv)
+    try:
+        video_url = None
+        if args.event == "end":
+            client = MotionEyeClient(
+                args.motioneye_api_url or args.motioneye_url,
+                args.motioneye_username,
+                args.motioneye_password,
+            )
+            client.login()
+            recording = client.latest_recording(args.camera_id)
+            video_url = playback_url(args.motioneye_url, args.camera_id, recording)
+        send_notification(args.webhook_url, build_payload(args, video_url))
+    except NotificationError as error:
+        sys.stderr.write("Notification failed: " + str(error) + "\n")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    wh = motionEyeDiscordWebHook()
-    wh.send_to_discord(wh.get_latest_file())
+    sys.exit(main())
